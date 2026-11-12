@@ -1,0 +1,7 @@
+{
+  "FIREBASE_API_KEY": "from-your-Firebase-Android-app",
+  "FIREBASE_APP_ID": "from-your-Firebase-Android-app",
+  "FIREBASE_PROJECT_ID": "your-project-id",
+  "FIREBASE_SENDER_ID": "your-project-number",
+  "FIREBASE_GOOGLE_CLIENT_ID": "web-oauth-client-id.apps.googleusercontent.com"
+}

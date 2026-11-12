@@ -1,0 +1,156 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signed() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function group(g) { return get(/databases/$(database)/documents/groups/$(g)).data; }
+    function member(g) { return signed() && exists(/databases/$(database)/documents/groups/$(g)/members/$(uid())); }
+    function owner(g) { return member(g) && get(/databases/$(database)/documents/groups/$(g)/members/$(uid())).data.role == 'owner'; }
+    function afterMember(g) { return getAfter(/databases/$(database)/documents/groups/$(g)/members/$(uid())).data; }
+    function short(s, n) { return s is string && s.size() <= n; }
+    function changedOnly(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+    function validBooking(b) {
+      return b.keys().hasOnly(['userId','driver','startAt','endAt','estimatedKm','note','status','createdAt','decisionNote'])
+        && b.userId == uid() && short(b.driver, 80) && short(b.note, 500)
+        && b.startAt is timestamp && b.endAt is timestamp && b.endAt > b.startAt
+        && b.startAt >= request.time - duration.value(5, 'm')
+        && b.endAt - b.startAt <= duration.value(31, 'd')
+        && b.estimatedKm is int && b.estimatedKm >= 0 && b.estimatedKm <= 100000
+        && b.status == 'requested' && b.createdAt == request.time && b.decisionNote == '';
+    }
+    match /users/{u} {
+      allow read: if signed() && uid() == u;
+      allow create: if signed() && uid() == u && request.resource.data.keys().hasOnly(['name','groupId'])
+        && short(request.resource.data.name, 80) && request.resource.data.groupId == null;
+      allow update: if signed() && uid() == u && request.resource.data.keys().hasOnly(['name','groupId'])
+        && short(request.resource.data.name, 80)
+        && (changedOnly(['name']) || (resource.data.groupId == null && changedOnly(['groupId'])
+          && afterMember(request.resource.data.groupId).uid == uid()));
+    }
+    // A private join proof keeps owner invitation codes out of member records.
+    match /joinProofs/{u} {
+      allow read: if signed() && uid() == u;
+      allow create, update: if signed() && uid() == u
+        && request.resource.data.keys().hasOnly(['code','groupId'])
+        && get(/databases/$(database)/documents/invites/$(request.resource.data.code)).data.groupId == request.resource.data.groupId;
+    }
+    match /invites/{code} {
+      allow get: if signed();
+      allow list: if false;
+      allow create: if signed() && request.resource.data.keys().hasOnly(['groupId','role'])
+        && code.size() >= 32 && request.resource.data.role in ['owner','borrower']
+        && afterMember(request.resource.data.groupId).role == 'owner';
+      allow delete: if owner(resource.data.groupId);
+    }
+    match /groups/{g} {
+      allow read: if member(g);
+      allow create: if signed() && request.resource.data.keys().hasOnly([
+          'name','createdBy','createdAt','timeZone','activeTripId','lastOdometer','schedule',
+          'spliitGroupId','spliitName','spliitMembers','spliitMemberIds','ownerMemberId'])
+        && request.resource.data.createdBy == uid() && short(request.resource.data.name, 80)
+        && request.resource.data.createdAt == request.time && request.resource.data.timeZone == 'America/Vancouver'
+        && request.resource.data.activeTripId == null && request.resource.data.lastOdometer == null
+        && request.resource.data.schedule == {} && request.resource.data.spliitGroupId == ''
+        && request.resource.data.spliitName == '' && request.resource.data.ownerMemberId == ''
+        && request.resource.data.spliitMembers == [] && request.resource.data.spliitMemberIds == [] && afterMember(g).role == 'owner';
+      allow update: if member(g) && (
+        (owner(g) && changedOnly(['name','schedule','spliitGroupId','spliitName','spliitMembers','spliitMemberIds','ownerMemberId'])
+          && short(request.resource.data.name, 80) && short(request.resource.data.spliitGroupId, 64)
+          && short(request.resource.data.spliitName, 80) && short(request.resource.data.ownerMemberId, 64)
+          && request.resource.data.spliitMembers is list && request.resource.data.spliitMembers.size() <= 100
+          && request.resource.data.spliitMemberIds is list && request.resource.data.spliitMemberIds.size() <= 100)
+        || (changedOnly(['activeTripId']) && resource.data.activeTripId == null
+          && getAfter(/databases/$(database)/documents/groups/$(g)/trips/$(request.resource.data.activeTripId)).data.userId == uid()
+          && getAfter(/databases/$(database)/documents/groups/$(g)/trips/$(request.resource.data.activeTripId)).data.status == 'active')
+        || (changedOnly(['activeTripId','lastOdometer','schedule']) && resource.data.activeTripId != null
+          && request.resource.data.activeTripId == null
+          && getAfter(/databases/$(database)/documents/groups/$(g)/trips/$(resource.data.activeTripId)).data.userId == uid()
+          && getAfter(/databases/$(database)/documents/groups/$(g)/trips/$(resource.data.activeTripId)).data.status == 'completed'
+          && request.resource.data.lastOdometer == getAfter(/databases/$(database)/documents/groups/$(g)/trips/$(resource.data.activeTripId)).data.endKm
+          && request.resource.data.schedule.diff(resource.data.schedule).affectedKeys().hasOnly([
+            getAfter(/databases/$(database)/documents/groups/$(g)/trips/$(resource.data.activeTripId)).data.bookingId]))
+      );
+      match /members/{u} {
+        allow read: if member(g);
+        allow create: if signed() && u == uid() && request.resource.data.keys().hasOnly(['uid','name','role','spliitMemberId'])
+          && request.resource.data.uid == uid() && short(request.resource.data.name, 80)
+          && request.resource.data.spliitMemberId == '' && (
+            (!exists(/databases/$(database)/documents/groups/$(g))
+              && getAfter(/databases/$(database)/documents/groups/$(g)).data.createdBy == uid()
+              && request.resource.data.role == 'owner')
+            || (get(/databases/$(database)/documents/users/$(uid())).data.groupId == null
+              && getAfter(/databases/$(database)/documents/joinProofs/$(uid())).data.groupId == g
+              && get(/databases/$(database)/documents/invites/$(getAfter(/databases/$(database)/documents/joinProofs/$(uid())).data.code)).data.role == request.resource.data.role)
+          );
+        allow update: if member(g) && u == uid() && changedOnly(['spliitMemberId'])
+          && short(request.resource.data.spliitMemberId, 64)
+          && request.resource.data.spliitMemberId != group(g).ownerMemberId
+          && request.resource.data.spliitMemberId in group(g).spliitMemberIds
+          && getAfter(/databases/$(database)/documents/groups/$(g)/spliitClaims/$(request.resource.data.spliitMemberId)).data.uid == uid();
+      }
+      match /spliitClaims/{remoteId} {
+        allow read: if member(g);
+        allow create: if member(g) && request.resource.data.keys().hasOnly(['uid'])
+          && request.resource.data.uid == uid() && remoteId in group(g).spliitMemberIds
+          && remoteId != group(g).ownerMemberId;
+        allow delete: if member(g) && resource.data.uid == uid();
+      }
+      match /private/{doc} {
+        allow read: if owner(g);
+        allow write: if signed() && afterMember(g).role == 'owner' && doc == 'invites'
+          && request.resource.data.keys().hasOnly(['ownerCode','borrowerCode']);
+      }
+      match /bookings/{b} {
+        allow read: if member(g);
+        allow create: if member(g) && validBooking(request.resource.data);
+        allow update: if member(g) && changedOnly(['status','decisionNote']) && short(request.resource.data.decisionNote, 500) && (
+          (owner(g) && resource.data.status == 'requested' && request.resource.data.status in ['approved','denied'])
+          || ((owner(g) || resource.data.userId == uid()) && resource.data.status in ['requested','approved'] && request.resource.data.status == 'cancelled')
+          || (resource.data.userId == uid() && resource.data.status == 'approved' && request.resource.data.status == 'active'
+            && getAfter(/databases/$(database)/documents/groups/$(g)/trips/$(getAfter(/databases/$(database)/documents/groups/$(g)).data.activeTripId)).data.bookingId == b)
+          || (resource.data.userId == uid() && resource.data.status == 'active' && request.resource.data.status == 'completed'
+            && getAfter(/databases/$(database)/documents/groups/$(g)).data.activeTripId == null)
+        );
+      }
+      match /trips/{t} {
+        allow read: if member(g);
+        allow create: if member(g) && request.resource.data.keys().hasOnly([
+          'userId','driver','bookingId','startAt','startKm','endAt','endKm','status','sync','expenseId','remoteGroupId','payerId','borrowerId'])
+          && request.resource.data.userId == uid() && short(request.resource.data.driver, 80)
+          && request.resource.data.startAt == request.time && request.resource.data.startKm is int
+          && request.resource.data.startKm >= 0 && request.resource.data.startKm < 10000000
+          && (group(g).lastOdometer == null || request.resource.data.startKm >= group(g).lastOdometer)
+          && request.resource.data.endAt == null && request.resource.data.endKm == null
+          && request.resource.data.status == 'active' && request.resource.data.sync == 'local' && request.resource.data.expenseId == ''
+          && request.resource.data.remoteGroupId == '' && request.resource.data.payerId == '' && request.resource.data.borrowerId == ''
+          && get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data.userId == uid()
+          && get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data.status == 'approved'
+          && get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data.startAt <= request.time
+          && get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data.endAt > request.time
+          && group(g).activeTripId == null && getAfter(/databases/$(database)/documents/groups/$(g)).data.activeTripId == t;
+        allow update: if member(g) && resource.data.userId == uid() && (
+          (resource.data.status == 'active' && changedOnly(['status','endAt','endKm'])
+            && request.resource.data.status == 'completed' && request.resource.data.endAt is timestamp
+            && request.resource.data.endAt >= resource.data.startAt
+            && request.resource.data.endAt <= request.time + duration.value(5, 'm')
+            && request.resource.data.endAt - resource.data.startAt <= duration.value(31, 'd')
+            && request.resource.data.endKm is int && request.resource.data.endKm >= resource.data.startKm
+            && request.resource.data.endKm - resource.data.startKm <= 100000
+            && getAfter(/databases/$(database)/documents/groups/$(g)).data.activeTripId == null
+            && getAfter(/databases/$(database)/documents/groups/$(g)/bookings/$(resource.data.bookingId)).data.status == 'completed')
+          || (resource.data.status == 'completed' && changedOnly(['sync','expenseId'])
+            && request.resource.data.sync in ['local','pending','sending','uncertain','sent']
+            && short(request.resource.data.expenseId, 64))
+          || (resource.data.status == 'completed' && resource.data.remoteGroupId == ''
+            && resource.data.sync in ['local','pending'] && request.resource.data.sync == 'sending'
+            && changedOnly(['sync','remoteGroupId','payerId','borrowerId'])
+            && request.resource.data.remoteGroupId == group(g).spliitGroupId
+            && request.resource.data.payerId == group(g).ownerMemberId
+            && request.resource.data.borrowerId == get(/databases/$(database)/documents/groups/$(g)/members/$(uid())).data.spliitMemberId
+            && request.resource.data.borrowerId != request.resource.data.payerId
+            && request.resource.data.remoteGroupId != '' && request.resource.data.borrowerId != '')
+        );
+      }
+    }
+  }
+}
