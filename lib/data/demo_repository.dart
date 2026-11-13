@@ -1,4 +1,6 @@
 import 'repository.dart';
+import '../domain/pricing.dart';
+import '../domain/shared_ride.dart';
 
 class DemoRepository extends Repository {
   DemoRepository() {
@@ -23,6 +25,7 @@ class DemoRepository extends Repository {
         'spliitMemberId': '',
       },
       {'id': 'alex', 'name': 'Alex', 'role': 'borrower', 'spliitMemberId': ''},
+      {'id': 'sam', 'name': 'Sam', 'role': 'borrower', 'spliitMemberId': ''},
     ];
     final start = DateTime.now().subtract(const Duration(minutes: 30));
     bookings = [
@@ -80,12 +83,33 @@ class DemoRepository extends Repository {
             ...data,
             'status': 'requested',
             'decisionNote': '',
+            'riderIds': data['riderIds'] ?? [uid],
+            'ownerClearances': <String, dynamic>{},
           },
           ...bookings,
         ];
       case 'decision':
+      case 'fineByMe':
         final b = bookings.firstWhere((b) => b['id'] == data['id']);
-        if (data['status'] == 'approved') {
+        final fine = action == 'fineByMe';
+        var status = data['status'] ?? 'requested';
+        if (fine || status == 'approved' || status == 'denied') {
+          if (!owner) throw StateError('Only owners can review a request.');
+          if (b['status'] != 'requested') {
+            throw StateError('This request has already changed.');
+          }
+        }
+        final votes = Map<String, dynamic>.from(b['ownerClearances'] ?? {});
+        if (fine) {
+          votes[uid!] = DateTime.now().toIso8601String();
+          status =
+              members
+                  .where((m) => m['role'] == 'owner')
+                  .every((m) => votes.containsKey(m['id']))
+              ? 'approved'
+              : 'requested';
+        }
+        if (status == 'approved') {
           if (!owner) throw StateError('Only owners can approve.');
           final s = DateTime.parse(b['startAt']),
               e = DateTime.parse(b['endAt']);
@@ -99,7 +123,8 @@ class DemoRepository extends Repository {
             throw StateError('That overlaps an approved booking.');
           }
         }
-        b['status'] = data['status'];
+        b['status'] = status;
+        if (fine) b['ownerClearances'] = votes;
         b['decisionNote'] = data['note'] ?? '';
       case 'start':
         if (group!['activeTripId'] != null) {
@@ -111,6 +136,7 @@ class DemoRepository extends Repository {
           {
             'id': id,
             'bookingId': b['id'],
+            'riderIds': rideUserIds(b),
             'userId': uid,
             'driver': user!['name'],
             'startAt': DateTime.now().toIso8601String(),
@@ -134,6 +160,52 @@ class DemoRepository extends Repository {
             'completed';
         group!['activeTripId'] = null;
         group!['lastOdometer'] = data['km'];
+      case 'editTrip':
+      case 'deleteTrip':
+      case 'restoreTrip':
+        if (!owner) throw StateError('Only an owner can change a trip.');
+        final t = trips.firstWhere((t) => t['id'] == data['id']);
+        if (t['changeId'] != data['expectedChangeId']) {
+          throw StateError('This trip has changed. Reopen it.');
+        }
+        final oldStatus = t['status'];
+        if (action == 'editTrip') {
+          KonaPricing.calculate(
+            start: DateTime.parse(data['startAt']),
+            end: DateTime.parse(data['endAt']),
+            km: data['endKm'] - data['startKm'],
+          );
+          t.addAll({
+            'startAt': data['startAt'],
+            'endAt': data['endAt'],
+            'startKm': data['startKm'],
+            'endKm': data['endKm'],
+            'status': 'completed',
+          });
+          if (oldStatus == 'active') group!['lastOdometer'] = data['endKm'];
+        } else if (action == 'deleteTrip') {
+          t.addAll({'status': 'deleted', 'deletedFrom': oldStatus});
+        } else {
+          if (t['deletedFrom'] == 'active' && group!['activeTripId'] != null) {
+            throw StateError('Another trip is active.');
+          }
+          t['status'] = t['deletedFrom'];
+        }
+        if (group!['activeTripId'] == t['id'] && t['status'] != 'active') {
+          group!['activeTripId'] = null;
+        }
+        if (t['status'] == 'active') group!['activeTripId'] = t['id'];
+        bookings.firstWhere((b) => b['id'] == t['bookingId'])['status'] =
+            t['status'] == 'deleted' ? 'cancelled' : t['status'];
+        t.addAll({
+          'editedBy': uid,
+          'editedByName': user!['name'],
+          'editedAt': DateTime.now().toIso8601String(),
+          'editReason': data['reason'] ?? '',
+          'changeId': randomCode(21),
+        });
+        notifyListeners();
+        return {};
       case 'pendingFinish':
         return {};
       case 'invites':

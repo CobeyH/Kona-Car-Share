@@ -10,6 +10,8 @@ import 'package:google_sign_in/google_sign_in.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'spliit_service.dart';
+import '../domain/pricing.dart';
+import '../domain/shared_ride.dart';
 
 typedef Json = Map<String, dynamic>;
 String randomCode([int length = 32]) {
@@ -248,6 +250,7 @@ class FirebaseRepository extends Repository {
           tx.set(ref, {
             'name': data['name'],
             'createdBy': u,
+            'ownerRosterVersion': 0,
             'createdAt': FieldValue.serverTimestamp(),
             'timeZone': 'America/Vancouver',
             'activeTripId': null,
@@ -301,6 +304,10 @@ class FirebaseRepository extends Repository {
             'code': code,
             'groupId': g.id,
           });
+          if (invitation.data()!['role'] == 'owner') {
+            // Invalidate concurrent consensus reviews when the owner roster changes.
+            tx.update(g, {'ownerRosterVersion': FieldValue.increment(1)});
+          }
           tx.set(g.collection('members').doc(u), {
             'uid': u,
             'name': user!['name'],
@@ -332,9 +339,20 @@ class FirebaseRepository extends Repository {
         });
         return await command('invites');
       case 'request':
+        final riders = List<String>.from(data['riderIds'] ?? [u]);
+        if (riders.isEmpty ||
+            riders.first != u ||
+            riders.length > 5 ||
+            riders.toSet().length != riders.length) {
+          throw StateError(
+            'Choose up to five distinct borrowers, including yourself.',
+          );
+        }
         await groupRef.collection('bookings').add({
           'userId': u,
           'driver': user!['name'],
+          'riderIds': riders,
+          'ownerClearances': <String, dynamic>{},
           'startAt': Timestamp.fromDate(DateTime.parse(data['startAt'])),
           'endAt': Timestamp.fromDate(DateTime.parse(data['endAt'])),
           'estimatedKm': data['estimatedKm'],
@@ -345,22 +363,47 @@ class FirebaseRepository extends Repository {
         });
         return {};
       case 'decision':
+      case 'fineByMe':
         final ref = groupRef.collection('bookings').doc(data['id']);
         await db.runTransaction((tx) async {
           final g = (await tx.get(groupRef)).data()!;
           final booking = (await tx.get(ref)).data()!;
           final schedule = Map<String, dynamic>.from(g['schedule'] ?? {});
-          if (data['status'] == 'approved') {
+          final fine = action == 'fineByMe';
+          var status = data['status'] as String? ?? 'requested';
+          final clearances = Map<String, dynamic>.from(
+            booking['ownerClearances'] ?? {},
+          );
+          List<String>? currentOwners;
+          if (fine || status == 'approved' || status == 'denied') {
+            if (!owner) throw StateError('Only owners can review a request.');
             if (booking['status'] != 'requested') {
               throw StateError('This request has already changed.');
             }
+          }
+          if (fine) {
+            // This query is repeated on every transaction retry. Owner joins
+            // also write the group, so a concurrent join invalidates this read.
+            final roster = await groupRef
+                .collection('members')
+                .where('role', isEqualTo: 'owner')
+                .get(const GetOptions(source: Source.server));
+            currentOwners = roster.docs.map((d) => d.id).toList();
+            if (!currentOwners.contains(u)) {
+              throw StateError('Only owners can review a request.');
+            }
+            clearances[u] = FieldValue.serverTimestamp();
+            status = currentOwners.every(clearances.containsKey)
+                ? 'approved'
+                : 'requested';
+          }
+          if (status == 'approved') {
             final start =
                 (booking['startAt'] as Timestamp).millisecondsSinceEpoch;
             final end = (booking['endAt'] as Timestamp).millisecondsSinceEpoch;
-            // Read each scheduled booking inside the transaction, so cancelled
-            // requests are pruned and concurrent owner approvals retry safely.
             final stale = <String>[];
             for (final entry in schedule.entries) {
+              if (entry.key == ref.id) continue;
               final other = (await tx.get(
                 groupRef.collection('bookings').doc(entry.key),
               )).data();
@@ -377,12 +420,13 @@ class FirebaseRepository extends Repository {
               schedule.remove(key);
             }
             schedule[ref.id] = {'start': start, 'end': end};
-          } else if (owner) {
+          } else if (owner && !fine) {
             schedule.remove(ref.id);
           }
           tx.update(ref, {
-            'status': data['status'],
+            'status': status,
             'decisionNote': data['note'] ?? '',
+            if (fine) 'ownerClearances.$u': FieldValue.serverTimestamp(),
           });
           if (owner) tx.update(groupRef, {'schedule': schedule});
         });
@@ -409,6 +453,8 @@ class FirebaseRepository extends Repository {
           tx.set(groupRef.collection('trips').doc(id), {
             'userId': u,
             'driver': user!['name'],
+            'riderIds': rideUserIds(b),
+            'borrowerIds': <String>[],
             'bookingId': bookingRef.id,
             'startAt': FieldValue.serverTimestamp(),
             'startKm': data['km'],
@@ -456,7 +502,15 @@ class FirebaseRepository extends Repository {
         return {};
       case 'pendingFinish':
         final saved = preferences.getString('finish_${_groupId}_$u');
-        return saved == null ? {} : jsonDecode(saved) as Json;
+        if (saved == null) return {};
+        final draft = jsonDecode(saved) as Json;
+        if (trips.any(
+          (t) => t['id'] == draft['id'] && t['status'] != 'active',
+        )) {
+          await preferences.remove('finish_${_groupId}_$u');
+          return {};
+        }
+        return draft;
       case 'spliitPreview':
         return await spliit.group(data['url']);
       case 'spliitConnect':
@@ -503,11 +557,217 @@ class FirebaseRepository extends Repository {
           tx.update(memberRef, {'spliitMemberId': data['memberId']});
         });
         return {};
+      case 'editTrip':
+      case 'deleteTrip':
+      case 'restoreTrip':
+        return {'needsLedger': await _ownerChange(action, data)};
+      case 'syncCorrection':
+        await _syncCorrection(data['id']);
+        return {};
       case 'sync':
         await _sync(data['id']);
         return {};
       default:
         throw StateError('Unknown action.');
+    }
+  }
+
+  Future<bool> _ownerChange(String action, Json data) async {
+    if (!owner) throw StateError('Only an owner can change a trip.');
+    final ref = groupRef.collection('trips').doc(data['id']);
+    final revision = randomCode(21);
+    var needsLedger = false;
+    await db.runTransaction((tx) async {
+      final trip = (await tx.get(ref)).data()!;
+      final g = (await tx.get(groupRef)).data()!;
+      final bookingRef = groupRef.collection('bookings').doc(trip['bookingId']);
+      final booking = (await tx.get(bookingRef)).data()!;
+      if (trip['changeId'] != data['expectedChangeId']) {
+        throw StateError('This trip has changed. Reopen it before editing.');
+      }
+      if (trip['ledgerState'] == 'sending') {
+        throw StateError(
+          'A Spliit correction is in progress. Check Spliit first, then try again.',
+        );
+      }
+      final patch = <String, dynamic>{
+        'changeId': revision,
+        'editedBy': uid,
+        'editedByName': user!['name'],
+        'editedAt': FieldValue.serverTimestamp(),
+        'editReason': data['reason'] ?? '',
+      };
+      final groupPatch = <String, dynamic>{};
+      final schedule = Map<String, dynamic>.from(g['schedule'] ?? {});
+      String state;
+      if (action == 'editTrip') {
+        if (!['active', 'completed'].contains(trip['status'])) {
+          throw StateError('Restore this trip before editing it.');
+        }
+        final start = DateTime.parse(data['startAt']),
+            end = DateTime.parse(data['endAt']);
+        final startKm = data['startKm'] as int, endKm = data['endKm'] as int;
+        if (startKm < 0 ||
+            endKm < startKm ||
+            end.isAfter(DateTime.now().add(const Duration(minutes: 5)))) {
+          throw StateError('Check the times and odometer readings.');
+        }
+        KonaPricing.calculate(start: start, end: end, km: endKm - startKm);
+        patch.addAll({
+          'startAt': Timestamp.fromDate(start),
+          'endAt': Timestamp.fromDate(end),
+          'startKm': startKm,
+          'endKm': endKm,
+          'status': 'completed',
+        });
+        state = 'completed';
+        if (trip['status'] == 'active' ||
+            (g['activeTripId'] == null && g['lastOdometer'] == trip['endKm'])) {
+          groupPatch['lastOdometer'] = endKm;
+        }
+      } else if (action == 'deleteTrip') {
+        if (trip['status'] == 'deleted') {
+          throw StateError('This trip is already deleted.');
+        }
+        state = 'deleted';
+        patch.addAll({'status': state, 'deletedFrom': trip['status']});
+      } else {
+        if (trip['status'] != 'deleted') {
+          throw StateError('This trip is not deleted.');
+        }
+        state = trip['deletedFrom'] as String;
+        if (state == 'active' && g['activeTripId'] != null) {
+          throw StateError(
+            'Another trip is active. Finish it before restoring this one.',
+          );
+        }
+        patch['status'] = state;
+      }
+      if (state == 'active') {
+        groupPatch['activeTripId'] = ref.id;
+        schedule[trip['bookingId']] = {
+          'start': (booking['startAt'] as Timestamp).millisecondsSinceEpoch,
+          'end': (booking['endAt'] as Timestamp).millisecondsSinceEpoch,
+        };
+      } else {
+        schedule.remove(trip['bookingId']);
+        if (g['activeTripId'] == ref.id) groupPatch['activeTripId'] = null;
+      }
+      groupPatch['schedule'] = schedule;
+      final remote = trip['remoteGroupId'] as String? ?? '';
+      needsLedger = remote.isNotEmpty;
+      if (remote.isNotEmpty) {
+        patch.addAll({
+          'ledgerAction': state == 'deleted'
+              ? 'delete'
+              : action == 'restoreTrip'
+              ? 'restore'
+              : 'update',
+          'ledgerState': 'pending',
+          'ledgerCreateStarted': false,
+        });
+      }
+      tx.set(ref.collection('changes').doc(revision), {
+        'actorId': uid,
+        'actorName': user!['name'],
+        'action': action,
+        'at': FieldValue.serverTimestamp(),
+        'reason': data['reason'] ?? '',
+        'before': trip,
+      });
+      tx.update(ref, patch);
+      tx.update(bookingRef, {
+        'status': state == 'deleted' ? 'cancelled' : state,
+      });
+      tx.update(groupRef, groupPatch);
+    });
+    return needsLedger;
+  }
+
+  Future<void> _syncCorrection(String id) async {
+    if (!owner) throw StateError('Only an owner can synchronize a correction.');
+    if (_syncing) return;
+    _syncing = true;
+    final ref = groupRef.collection('trips').doc(id);
+    String? revision;
+    try {
+      late Json trip;
+      await db.runTransaction((tx) async {
+        final raw = (await tx.get(ref)).data()!;
+        trip = {'id': id, ...clean(raw) as Json};
+        if (trip['ledgerState'] == 'done') return;
+        final claimedAt = raw['ledgerClaimedAt'] as Timestamp?;
+        if (trip['ledgerState'] == 'sending' &&
+            claimedAt != null &&
+            DateTime.now().difference(claimedAt.toDate()) <
+                const Duration(seconds: 90)) {
+          throw StateError(
+            'This correction is already being sent. Try checking again shortly.',
+          );
+        }
+        revision = trip['changeId'];
+        tx.update(ref, {
+          'ledgerState': 'sending',
+          'ledgerClaimedAt': FieldValue.serverTimestamp(),
+        });
+      });
+      if (revision == null) return;
+      final remote = trip['remoteGroupId'] as String;
+      final existing = await spliit.findLinked(remote, trip);
+      String expenseId = existing ?? trip['expenseId'] ?? '';
+      if (trip['ledgerAction'] == 'delete') {
+        if (existing != null) {
+          await spliit.delete(remote, existing, trip['payerId']);
+        } else if (['sending', 'uncertain'].contains(trip['sync'])) {
+          throw StateError(
+            'The earlier Spliit send needs a check before its removal can be confirmed.',
+          );
+        }
+      } else if (existing != null) {
+        await spliit.update(
+          trip,
+          remote,
+          existing,
+          trip['payerId'],
+          trip['borrowerId'],
+        );
+      } else if (trip['ledgerAction'] == 'restore' &&
+          trip['ledgerCreateStarted'] != true &&
+          !['sending', 'uncertain'].contains(trip['sync'])) {
+        // Persist this BEFORE creating. If interrupted, only reconcile the
+        // matching expense; never blindly create a second copy.
+        await ref.update({'ledgerCreateStarted': true});
+        expenseId = await spliit.create(
+          trip,
+          remote,
+          trip['payerId'],
+          trip['borrowerId'],
+        );
+      } else {
+        throw StateError(
+          'No matching Spliit expense found yet. Check Spliit before continuing.',
+        );
+      }
+      await db.runTransaction((tx) async {
+        final current = (await tx.get(ref)).data()!;
+        if (current['changeId'] != revision) return;
+        tx.update(ref, {
+          'ledgerState': 'done',
+          'expenseId': expenseId,
+          if (trip['ledgerAction'] != 'delete') 'sync': 'sent',
+        });
+      });
+    } catch (_) {
+      if (revision != null) {
+        await db.runTransaction((tx) async {
+          if ((await tx.get(ref)).data()?['changeId'] == revision) {
+            tx.update(ref, {'ledgerState': 'uncertain'});
+          }
+        });
+      }
+      rethrow;
+    } finally {
+      _syncing = false;
     }
   }
 
@@ -523,12 +783,19 @@ class FirebaseRepository extends Repository {
       await db.runTransaction((tx) async {
         final snapshot = await tx.get(ref);
         final settings = (await tx.get(groupRef)).data()!;
-        final membership = (await tx.get(
-          groupRef.collection('members').doc(uid),
-        )).data()!;
         trip = {'id': id, ...clean(snapshot.data()) as Json};
-        if (trip['userId'] != uid || trip['status'] != 'completed') {
+        final memberships = <Json>[];
+        for (final rider in rideUserIds(trip)) {
+          memberships.add(
+            (await tx.get(groupRef.collection('members').doc(rider))).data()!,
+          );
+        }
+        if ((trip['userId'] != uid && !owner) ||
+            trip['status'] != 'completed') {
           throw StateError('Only your completed trips can be sent.');
+        }
+        if (['pending', 'sending', 'uncertain'].contains(trip['ledgerState'])) {
+          throw StateError('Synchronize the owner’s correction first.');
         }
         remoteGroup = trip['remoteGroupId'] as String? ?? '';
         payer = trip['payerId'] as String? ?? '';
@@ -537,7 +804,17 @@ class FirebaseRepository extends Repository {
         if (firstSend) {
           remoteGroup = settings['spliitGroupId'];
           payer = settings['ownerMemberId'];
-          borrower = membership['spliitMemberId'];
+          final mapped = memberships
+              .map((m) => m['spliitMemberId'] as String? ?? '')
+              .toList();
+          if (mapped.any((id) => id.isEmpty || id == payer) ||
+              mapped.toSet().length != mapped.length) {
+            throw StateError(
+              'Every borrower on the ride must link a different Spliit participant in House before this expense can be sent.',
+            );
+          }
+          trip['borrowerIds'] = mapped;
+          borrower = mapped.first;
         }
         if (remoteGroup.isEmpty ||
             payer.isEmpty ||
@@ -555,6 +832,7 @@ class FirebaseRepository extends Repository {
               'remoteGroupId': remoteGroup,
               'payerId': payer,
               'borrowerId': borrower,
+              'borrowerIds': trip['borrowerIds'],
             },
           });
         }

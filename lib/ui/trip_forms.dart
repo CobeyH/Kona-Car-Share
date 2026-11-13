@@ -109,6 +109,7 @@ class _BookingFormState extends State<BookingForm> {
   late DateTime start = homeNow.add(const Duration(hours: 1)),
       end = start.add(const Duration(hours: 2));
   final km = TextEditingController(text: '30'), note = TextEditingController();
+  final invited = <String>{};
   @override
   void dispose() {
     km.dispose();
@@ -185,6 +186,49 @@ class _BookingFormState extends State<BookingForm> {
               helperText: 'A rough estimate is fine. The odometer gives the final distance.',
             ),
           ),
+          Panel(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                label('Invite borrowers'),
+                const SizedBox(height: 8),
+                small(
+                  'You start and finish the trip. Its total cost is split equally between you and the borrowers you include.',
+                ),
+                for (final member in widget.model.repository.members.where(
+                  (v) =>
+                      v['role'] == 'borrower' &&
+                      v['id'] != widget.model.repository.uid,
+                ))
+                  CheckboxListTile(
+                    contentPadding: EdgeInsets.zero,
+                    key: ValueKey('invite-${member['id']}'),
+                    title: Text(member['name']),
+                    value: invited.contains(member['id']),
+                    onChanged:
+                        !invited.contains(member['id']) && invited.length >= 4
+                        ? null
+                        : (selected) => setState(() {
+                            if (selected == true && invited.length < 4) {
+                              invited.add(member['id']);
+                            } else if (selected == false) {
+                              invited.remove(member['id']);
+                            }
+                          }),
+                  ),
+                if (widget.model.repository.members
+                    .where(
+                      (v) =>
+                          v['role'] == 'borrower' &&
+                          v['id'] != widget.model.repository.uid,
+                    )
+                    .isEmpty)
+                  small(
+                    'Other borrowers will appear here when they join the house.',
+                  ),
+              ],
+            ),
+          ),
           TextField(
             controller: note,
             maxLength: 500,
@@ -197,7 +241,21 @@ class _BookingFormState extends State<BookingForm> {
           if (fare != null)
             Panel(
               color: mint,
-              child: FareBreakdown(fare: fare, estimate: true),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  FareBreakdown(fare: fare, estimate: true),
+                  RideSplit(
+                    model: widget.model,
+                    ride: {
+                      'userId': widget.model.repository.uid,
+                      'riderIds': [widget.model.repository.uid!, ...invited],
+                    },
+                    totalCents: fare.totalCents,
+                    estimate: true,
+                  ),
+                ],
+              ),
             )
           else
             const Text(
@@ -212,6 +270,7 @@ class _BookingFormState extends State<BookingForm> {
                       'endAt': end.toUtc().toIso8601String(),
                       'estimatedKm': distance,
                       'note': note.text.trim(),
+                      'riderIds': [widget.model.repository.uid!, ...invited],
                     });
                     if (okay && context.mounted) Navigator.pop(context);
                   }
@@ -418,7 +477,17 @@ class _OdometerFormState extends State<OdometerForm> {
           if (fare != null)
             Panel(
               color: mint,
-              child: FareBreakdown(fare: fare, estimate: false),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  FareBreakdown(fare: fare, estimate: false),
+                  RideSplit(
+                    model: widget.model,
+                    ride: widget.trip!,
+                    totalCents: fare.totalCents,
+                  ),
+                ],
+              ),
             ),
           if (value != null && value < startKm)
             const Text(
@@ -448,6 +517,48 @@ class _OdometerFormState extends State<OdometerForm> {
             small(
               'Plug the Kona in if the battery is below 30%. Please leave it as you found it.',
             ),
+        ],
+      ),
+    );
+  }
+}
+
+class RideSplit extends StatelessWidget {
+  const RideSplit({
+    super.key,
+    required this.model,
+    required this.ride,
+    required this.totalCents,
+    this.estimate = false,
+  });
+  final AppModel model;
+  final Json ride;
+  final int totalCents;
+  final bool estimate;
+  @override
+  Widget build(BuildContext context) {
+    final ids = rideUserIds(ride);
+    if (ids.length < 2) return const SizedBox.shrink();
+    final shares = equalRideShares(totalCents, ids);
+    String name(String id) =>
+        model.repository.members
+            .where((v) => v['id'] == id)
+            .firstOrNull?['name'] ??
+        (id == ride['userId'] ? ride['driver'] ?? 'You' : 'Borrower');
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          label(estimate ? 'Estimated split' : 'Cost split'),
+          for (final id in ids)
+            line(
+              '${name(id)}${id == model.repository.uid ? ' (you)' : ''}',
+              money(shares[id]!),
+            ),
+          small(
+            'Shared equally${totalCents % ids.length == 0 ? '.' : '; any extra cents go to borrowers in the order listed.'}',
+          ),
         ],
       ),
     );

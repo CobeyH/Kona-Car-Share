@@ -8,11 +8,13 @@ import 'package:timezone/timezone.dart' as tz;
 
 import '../data/repository.dart';
 import '../domain/pricing.dart';
+import '../domain/shared_ride.dart';
 import 'app_model.dart';
 
 part 'trip_forms.dart';
 part 'account_pages.dart';
 part 'house_page.dart';
+part 'owner_trip_form.dart';
 
 const ink = Color(0xff173d34);
 const muted = Color(0xff68766e);
@@ -185,6 +187,8 @@ class MainShell extends StatefulWidget {
 class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   int tab = 0;
   Timer? timer;
+  int _tripNavigationEpoch = 0;
+  bool _routingNotification = false;
   AppModel get m => widget.model;
   @override
   void initState() {
@@ -211,6 +215,22 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
   }
 
   void _notice() {
+    if (m.openTripRequested &&
+        m.repository.group != null &&
+        m.repository.tripsReady &&
+        !_routingNotification) {
+      _routingNotification = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _routingNotification = false;
+        if (!mounted || !m.openTripRequested) return;
+        m.consumeTripScreenRequest();
+        Navigator.of(context).popUntil((route) => route.isFirst);
+        setState(() {
+          tab = 0;
+          _tripNavigationEpoch++;
+        });
+      });
+    }
     if (m.message != null) {
       final message = m.message!;
       m.clearMessage();
@@ -259,7 +279,10 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           final content = Center(
             child: ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 720),
-              child: pages[tab],
+              child: KeyedSubtree(
+                key: ValueKey('$tab/$_tripNavigationEpoch'),
+                child: pages[tab],
+              ),
             ),
           );
           return Scaffold(
@@ -385,7 +408,10 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final active = m.active;
     final approved =
         r.bookings
-            .where((b) => b['userId'] == r.uid && b['status'] == 'approved')
+            .where(
+              (b) =>
+                  rideUserIds(b).contains(r.uid) && b['status'] == 'approved',
+            )
             .toList()
           ..sort((a, b) => a['startAt'].compareTo(b['startAt']));
     final requests = r.bookings.where((b) => b['status'] == 'requested').length;
@@ -521,7 +547,8 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
           ),
         if (active == null && approved.isNotEmpty) ...[
           title(context, 'Your approved trips'),
-          for (final b in approved) bookingCard(context, b, start: true),
+          for (final b in approved)
+            bookingCard(context, b, start: b['userId'] == r.uid),
         ],
         Panel(
           child: Column(
@@ -554,6 +581,16 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     final status = b['status'] as String;
     final fare = bookingFare(b);
     final approved = ['approved', 'active'].contains(status);
+    final clearances = Map<String, dynamic>.from(b['ownerClearances'] ?? {});
+    final owners = r.members.where((v) => v['role'] == 'owner').toList();
+    final cleared = owners
+        .where((v) => clearances.containsKey(v['id']))
+        .map((v) => v['name'])
+        .join(', ');
+    final waiting = owners
+        .where((v) => !clearances.containsKey(v['id']))
+        .map((v) => v['name'])
+        .join(', ');
     final inWindow =
         !DateTime.now().isBefore(DateTime.parse(b['startAt'])) &&
         DateTime.now().isBefore(DateTime.parse(b['endAt']));
@@ -593,6 +630,16 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
               ),
             ],
           ),
+          RideSplit(
+            model: m,
+            ride: b,
+            totalCents: fare.totalCents,
+            estimate: true,
+          ),
+          if (status == 'requested') ...[
+            if (cleared.isNotEmpty) small('Fine by: $cleared'),
+            if (waiting.isNotEmpty) small('Waiting for: $waiting'),
+          ],
           if ((b['decisionNote'] as String? ?? '').isNotEmpty)
             small('Owner’s note: ${b['decisionNote']}'),
           const SizedBox(height: 12),
@@ -611,6 +658,21 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   icon: const Icon(Icons.check),
                   label: const Text('Approve'),
                 ),
+                if (clearances.containsKey(r.uid))
+                  const Chip(
+                    avatar: Icon(Icons.check, size: 18),
+                    label: Text('Fine by me'),
+                    backgroundColor: mint,
+                    side: BorderSide.none,
+                  )
+                else
+                  OutlinedButton.icon(
+                    onPressed: m.busy
+                        ? null
+                        : () => m.action('fineByMe', {'id': b['id']}),
+                    icon: const Icon(Icons.done),
+                    label: const Text('Fine by me'),
+                  ),
                 OutlinedButton(
                   onPressed: m.busy ? null : () => _decline(b),
                   child: const Text('Decline'),
@@ -756,14 +818,30 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
 
   Widget activity(BuildContext context) {
     final trips = m.completed
-        .where((t) => m.owner || t['userId'] == m.repository.uid)
+        .where((t) => m.owner || rideUserIds(t).contains(m.repository.uid))
         .toList();
+    final ongoing = m.owner
+        ? m.repository.trips.where((t) => t['status'] == 'active').toList()
+        : <Json>[];
+    final deleted = m.owner
+        ? m.repository.trips.where((t) => t['status'] == 'deleted').toList()
+        : <Json>[];
     final now = homeNow;
     final month = trips.where((t) {
       final end = homeTime(DateTime.parse(t['endAt']));
       return end.year == now.year && end.month == now.month;
     });
-    final total = month.fold<int>(0, (sum, t) => sum + tripFare(t).totalCents);
+    final total = month.fold<int>(
+      0,
+      (sum, t) =>
+          sum +
+          (m.owner
+              ? tripFare(t).totalCents
+              : equalRideShares(
+                  tripFare(t).totalCents,
+                  rideUserIds(t),
+                )[m.repository.uid]!),
+    );
     final due = tz.TZDateTime(
       tz.getLocation('America/Vancouver'),
       now.year,
@@ -773,6 +851,23 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
     return PageBody(
       children: [
         title(context, 'Every trip, accounted for.'),
+        if (ongoing.isNotEmpty) label('Active trips'),
+        for (final t in ongoing)
+          Panel(
+            color: mint,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '${t['driver']} · In progress',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                small('Started ${when(t['startAt'])} at ${t['startKm']} km'),
+                TripOwnerActions(model: m, trip: t),
+              ],
+            ),
+          ),
+
         Panel(
           color: ink,
           child: DefaultTextStyle.merge(
@@ -833,6 +928,11 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                 ),
                 const SizedBox(height: 8),
                 small('${t['endKm'] - t['startKm']} km · ${when(t['endAt'])}'),
+                RideSplit(
+                  model: m,
+                  ride: t,
+                  totalCents: tripFare(t).totalCents,
+                ),
                 ExpansionTile(
                   tilePadding: EdgeInsets.zero,
                   title: const Text('Price breakdown'),
@@ -845,7 +945,14 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                   ],
                 ),
                 small(_syncLabel(t['sync'])),
-                if (t['userId'] == m.repository.uid && t['sync'] != 'sent')
+                if (m.owner) TripOwnerActions(model: m, trip: t),
+                if ((m.owner || t['userId'] == m.repository.uid) &&
+                    t['sync'] != 'sent' &&
+                    ![
+                      'pending',
+                      'sending',
+                      'uncertain',
+                    ].contains(t['ledgerState']))
                   TextButton.icon(
                     onPressed: m.busy
                         ? null
@@ -857,6 +964,22 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                           : 'Send to Spliit',
                     ),
                   ),
+              ],
+            ),
+          ),
+
+        if (deleted.isNotEmpty) label('Deleted trips'),
+        for (final t in deleted)
+          Panel(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '${t['driver']} · Deleted',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                small('Started ${when(t['startAt'])}. Excluded from totals.'),
+                TripOwnerActions(model: m, trip: t),
               ],
             ),
           ),

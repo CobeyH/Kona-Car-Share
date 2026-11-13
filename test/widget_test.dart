@@ -17,7 +17,11 @@ void main() {
       scrollable: find.byType(Scrollable).first,
     );
     expect(find.text(r'$19.40'), findsNWidgets(2));
-    await tester.ensureVisible(find.byKey(const Key('estimated-km')));
+    await tester.scrollUntilVisible(
+      find.byKey(const Key('estimated-km')),
+      -250,
+      scrollable: find.byType(Scrollable).first,
+    );
     await tester.enterText(find.byKey(const Key('estimated-km')), '100');
     await tester.pump();
     await tester.scrollUntilVisible(
@@ -57,6 +61,7 @@ void main() {
     final model = AppModel(DemoRepository(), PhoneService());
     final trip = {
       'id': 'test',
+      'userId': 'alex',
       'startAt': DateTime.now()
           .subtract(const Duration(hours: 2))
           .toIso8601String(),

@@ -14,9 +14,11 @@ object TripReminders {
     const val CHANNEL = "kona_trips"
     const val GEOFENCE = "kona_home"
     const val FALLBACK = "ca.konashare.FALLBACK"
+    const val OPEN_TRIP = "ca.konashare.OPEN_ACTIVE_TRIP"
+    const val HOME_RADIUS = 200f
     fun prefs(c: Context) = c.getSharedPreferences("kona_phone", Context.MODE_PRIVATE)
     fun allowed(c: Context, permission: String) = ContextCompat.checkSelfPermission(c, permission) == PackageManager.PERMISSION_GRANTED
-    fun notificationAllowed(c: Context) = (Build.VERSION.SDK_INT < 33 || allowed(c, Manifest.permission.POST_NOTIFICATIONS)) && NotificationManagerCompat.from(c).areNotificationsEnabled()
+    fun notificationAllowed(c: Context) = (Build.VERSION.SDK_INT < 33 || allowed(c, Manifest.permission.POST_NOTIFICATIONS)) && NotificationManagerCompat.from(c).areNotificationsEnabled() && c.getSystemService(NotificationManager::class.java).getNotificationChannel(CHANNEL)?.importance != NotificationManager.IMPORTANCE_NONE
     fun backgroundAllowed(c: Context) = Build.VERSION.SDK_INT < 29 || allowed(c, Manifest.permission.ACCESS_BACKGROUND_LOCATION)
     fun channel(c: Context) {
         c.getSystemService(NotificationManager::class.java).createNotificationChannel(
@@ -26,7 +28,8 @@ object TripReminders {
         if (!notificationAllowed(c)) return
         channel(c)
         val open = PendingIntent.getActivity(c, 5, Intent(c, MainActivity::class.java)
-            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+            .setAction(OPEN_TRIP).putExtra("openActiveTrip", true)
+            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val n = NotificationCompat.Builder(c, CHANNEL).setSmallIcon(R.drawable.ic_trip)
             .setContentTitle(if (returned) "Home again? Finish your Kona trip" else "Kona trip in progress")
             .setContentText(if (returned) "Tap to confirm your return time and ending odometer." else "Tap when you return to enter the ending odometer.")
@@ -45,7 +48,7 @@ object TripReminders {
             done("Allow precise location all the time in Settings for home reminders."); return
         }
         val fence = Geofence.Builder().setRequestId(GEOFENCE)
-            .setCircularRegion(p.getString("lat", "0")!!.toDouble(), p.getString("lng", "0")!!.toDouble(), 200f)
+            .setCircularRegion(p.getString("lat", "0")!!.toDouble(), p.getString("lng", "0")!!.toDouble(), HOME_RADIUS)
             .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_EXIT or Geofence.GEOFENCE_TRANSITION_ENTER)
             .setExpirationDuration(Geofence.NEVER_EXPIRE).setNotificationResponsiveness(60000).build()
         val request = GeofencingRequest.Builder().setInitialTrigger(GeofencingRequest.INITIAL_TRIGGER_EXIT).addGeofence(fence).build()

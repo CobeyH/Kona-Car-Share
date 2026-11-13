@@ -17,8 +17,36 @@ class PhoneService {
     );
   }
 
-  Future<void> notifications() async {
-    if (android) await _channel.invokeMethod('notifications');
+  void onNotificationOpened(Future<void> Function()? handler) {
+    if (!android) return;
+    _channel.setMethodCallHandler(
+      handler == null
+          ? null
+          : (call) async {
+              if (call.method == 'notificationOpened') await handler();
+            },
+    );
+  }
+
+  Future<bool> consumeTripOpen() async => android
+      ? await _channel.invokeMethod<bool>('consumeTripOpen') ?? false
+      : false;
+  Future<String?> homeAddress() async =>
+      android ? await _channel.invokeMethod<String>('homeAddress') : null;
+  Future<void> viewHome() async {
+    if (android) await _channel.invokeMethod('viewHome');
+  }
+
+  Future<void> notificationSettings() async {
+    if (android) await _channel.invokeMethod('notificationSettings');
+  }
+
+  Future<void> notifications({bool openSettingsIfNeeded = false}) async {
+    if (android) {
+      await _channel.invokeMethod('notifications', {
+        'openSettingsIfNeeded': openSettingsIfNeeded,
+      });
+    }
   }
 
   Future<void> backgroundSettings() async {

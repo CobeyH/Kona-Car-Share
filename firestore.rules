@@ -5,17 +5,38 @@ service cloud.firestore {
     function uid() { return request.auth.uid; }
     function group(g) { return get(/databases/$(database)/documents/groups/$(g)).data; }
     function member(g) { return signed() && exists(/databases/$(database)/documents/groups/$(g)/members/$(uid())); }
-    function owner(g) { return member(g) && get(/databases/$(database)/documents/groups/$(g)/members/$(uid())).data.role == 'owner'; }
+    function owner(g) { return signed() && get(/databases/$(database)/documents/groups/$(g)/members/$(uid())).data.role == 'owner'; }
     function afterMember(g) { return getAfter(/databases/$(database)/documents/groups/$(g)/members/$(uid())).data; }
     function short(s, n) { return s is string && s.size() <= n; }
     function changedOnly(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
-    function validBooking(b) {
-      return b.keys().hasOnly(['userId','driver','startAt','endAt','estimatedKm','note','status','createdAt','decisionNote'])
+    function ledgerIdle(t) { return !(t.get('ledgerState', '') in ['pending','sending','uncertain']); }
+    function validTrip(t) { return t.startAt is timestamp && t.endAt is timestamp && t.endAt >= t.startAt && t.endAt <= request.time + duration.value(5, 'm') && t.endAt - t.startAt <= duration.value(31, 'd') && t.startKm is int && t.startKm >= 0 && t.endKm is int && t.endKm >= t.startKm && t.endKm < 10000000 && t.endKm - t.startKm <= 100000; }
+    function riders(t) { return t.get('riderIds', [t.userId]); }
+    function extraBorrower(g, ids, i) {
+      return ids.size() <= i || (short(ids[i],64) && get(/databases/$(database)/documents/groups/$(g)/members/$(ids[i])).data.role == 'borrower');
+    }
+    function validRiders(g, t) {
+      let ids = riders(t);
+      return ids is list && ids.size() >= 1 && ids.size() <= 5 && ids[0] == t.userId && ids.toSet().size() == ids.size()
+        && extraBorrower(g,ids,1) && extraBorrower(g,ids,2) && extraBorrower(g,ids,3) && extraBorrower(g,ids,4);
+    }
+    function mappedRider(g, t, ids, i) {
+      return ids.size() <= i || (short(ids[i],64) && ids[i] != '' && ids[i] != t.payerId
+        && ids[i] == get(/databases/$(database)/documents/groups/$(g)/members/$(riders(t)[i])).data.spliitMemberId);
+    }
+    function validMappedRiders(g, t) {
+      let ids = t.get('borrowerIds', [t.borrowerId]);
+      return ids is list && ids.size() == riders(t).size() && ids.size() >= 1 && ids.size() <= 5 && ids.toSet().size() == ids.size()
+        && t.borrowerId == ids[0] && mappedRider(g,t,ids,0) && mappedRider(g,t,ids,1) && mappedRider(g,t,ids,2) && mappedRider(g,t,ids,3) && mappedRider(g,t,ids,4);
+    }
+    function validBooking(g,b) {
+      return b.keys().hasOnly(['userId','driver','startAt','endAt','estimatedKm','note','status','createdAt','decisionNote','riderIds','ownerClearances'])
         && b.userId == uid() && short(b.driver, 80) && short(b.note, 500)
         && b.startAt is timestamp && b.endAt is timestamp && b.endAt > b.startAt
         && b.startAt >= request.time - duration.value(5, 'm')
         && b.endAt - b.startAt <= duration.value(31, 'd')
         && b.estimatedKm is int && b.estimatedKm >= 0 && b.estimatedKm <= 100000
+        && validRiders(g,b) && b.get('ownerClearances',{}) == {}
         && b.status == 'requested' && b.createdAt == request.time && b.decisionNote == '';
     }
     match /users/{u} {
@@ -46,15 +67,21 @@ service cloud.firestore {
       allow read: if member(g);
       allow create: if signed() && request.resource.data.keys().hasOnly([
           'name','createdBy','createdAt','timeZone','activeTripId','lastOdometer','schedule',
-          'spliitGroupId','spliitName','spliitMembers','spliitMemberIds','ownerMemberId'])
+          'spliitGroupId','spliitName','spliitMembers','spliitMemberIds','ownerMemberId','ownerRosterVersion'])
+        && request.resource.data.get('ownerRosterVersion',0) == 0
         && request.resource.data.createdBy == uid() && short(request.resource.data.name, 80)
         && request.resource.data.createdAt == request.time && request.resource.data.timeZone == 'America/Vancouver'
         && request.resource.data.activeTripId == null && request.resource.data.lastOdometer == null
         && request.resource.data.schedule == {} && request.resource.data.spliitGroupId == ''
         && request.resource.data.spliitName == '' && request.resource.data.ownerMemberId == ''
         && request.resource.data.spliitMembers == [] && request.resource.data.spliitMemberIds == [] && afterMember(g).role == 'owner';
+      allow update: if signed() && !exists(/databases/$(database)/documents/groups/$(g)/members/$(uid()))
+        && afterMember(g).role == 'owner' && changedOnly(['ownerRosterVersion'])
+        && request.resource.data.ownerRosterVersion == resource.data.get('ownerRosterVersion',0) + 1;
       allow update: if member(g) && (
-        (owner(g) && changedOnly(['name','schedule','spliitGroupId','spliitName','spliitMembers','spliitMemberIds','ownerMemberId'])
+        (owner(g) && changedOnly(['name','schedule','spliitGroupId','spliitName','spliitMembers','spliitMemberIds','ownerMemberId','activeTripId','lastOdometer'])
+          && (request.resource.data.activeTripId == null || short(request.resource.data.activeTripId,64))
+          && (request.resource.data.lastOdometer == null || (request.resource.data.lastOdometer is int && request.resource.data.lastOdometer >= 0 && request.resource.data.lastOdometer < 10000000))
           && short(request.resource.data.name, 80) && short(request.resource.data.spliitGroupId, 64)
           && short(request.resource.data.spliitName, 80) && short(request.resource.data.ownerMemberId, 64)
           && request.resource.data.spliitMembers is list && request.resource.data.spliitMembers.size() <= 100
@@ -80,7 +107,8 @@ service cloud.firestore {
               && request.resource.data.role == 'owner')
             || (get(/databases/$(database)/documents/users/$(uid())).data.groupId == null
               && getAfter(/databases/$(database)/documents/joinProofs/$(uid())).data.groupId == g
-              && get(/databases/$(database)/documents/invites/$(getAfter(/databases/$(database)/documents/joinProofs/$(uid())).data.code)).data.role == request.resource.data.role)
+              && get(/databases/$(database)/documents/invites/$(getAfter(/databases/$(database)/documents/joinProofs/$(uid())).data.code)).data.role == request.resource.data.role
+              && (request.resource.data.role != 'owner' || getAfter(/databases/$(database)/documents/groups/$(g)).data.ownerRosterVersion == group(g).get('ownerRosterVersion',0) + 1))
           );
         allow update: if member(g) && u == uid() && changedOnly(['spliitMemberId'])
           && short(request.resource.data.spliitMemberId, 64)
@@ -102,9 +130,17 @@ service cloud.firestore {
       }
       match /bookings/{b} {
         allow read: if member(g);
-        allow create: if member(g) && validBooking(request.resource.data);
+        allow create: if member(g) && validBooking(g,request.resource.data);
+        allow update: if owner(g) && resource.data.status == 'requested'
+          && request.resource.data.status in ['requested','approved'] && changedOnly(['status','decisionNote','ownerClearances'])
+          && request.resource.data.decisionNote == resource.data.decisionNote
+          && request.resource.data.ownerClearances is map
+          && request.resource.data.ownerClearances.diff(resource.data.get('ownerClearances',{})).affectedKeys().hasOnly([uid()])
+          && request.resource.data.ownerClearances[uid()] == request.time;
         allow update: if member(g) && changedOnly(['status','decisionNote']) && short(request.resource.data.decisionNote, 500) && (
-          (owner(g) && resource.data.status == 'requested' && request.resource.data.status in ['approved','denied'])
+          (owner(g) && resource.data.status in ['active','completed','cancelled'] && request.resource.data.status in ['completed','cancelled'])
+          || (owner(g) && resource.data.status == 'cancelled' && request.resource.data.status == 'active' && getAfter(/databases/$(database)/documents/groups/$(g)/trips/$(getAfter(/databases/$(database)/documents/groups/$(g)).data.activeTripId)).data.bookingId == b)
+          || (owner(g) && resource.data.status == 'requested' && request.resource.data.status in ['approved','denied'])
           || ((owner(g) || resource.data.userId == uid()) && resource.data.status in ['requested','approved'] && request.resource.data.status == 'cancelled')
           || (resource.data.userId == uid() && resource.data.status == 'approved' && request.resource.data.status == 'active'
             && getAfter(/databases/$(database)/documents/groups/$(g)/trips/$(getAfter(/databases/$(database)/documents/groups/$(g)).data.activeTripId)).data.bookingId == b)
@@ -113,9 +149,51 @@ service cloud.firestore {
         );
       }
       match /trips/{t} {
+        function auditedChange() {
+          let log = getAfter(/databases/$(database)/documents/groups/$(g)/trips/$(t)/changes/$(request.resource.data.changeId)).data;
+          return log.actorId == uid() && log.at == request.time && log.before == resource.data;
+        }
+        allow update: if request.resource.data.get('editedBy','') == uid() && request.resource.data.get('editedAt',null) == request.time
+          && owner(g) && resource.data.get('ledgerState','') != 'sending'
+          && changedOnly(['startAt','endAt','startKm','endKm','status','deletedFrom','changeId','editedBy','editedByName','editedAt','editReason','ledgerAction','ledgerState','ledgerCreateStarted'])
+          && request.resource.data.editedBy == uid() && request.resource.data.editedAt == request.time
+          && short(request.resource.data.editedByName,80) && short(request.resource.data.editReason,500)
+          && auditedChange() && (
+            (resource.data.status in ['active','completed'] && request.resource.data.status == 'completed'
+              && validTrip(request.resource.data)
+              && getAfter(/databases/$(database)/documents/groups/$(g)/bookings/$(resource.data.bookingId)).data.status == 'completed'
+              && getAfter(/databases/$(database)/documents/groups/$(g)).data.activeTripId != t)
+            || (resource.data.status in ['active','completed'] && request.resource.data.status == 'deleted'
+              && request.resource.data.deletedFrom == resource.data.status
+              && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['startAt','endAt','startKm','endKm'])
+              && getAfter(/databases/$(database)/documents/groups/$(g)/bookings/$(resource.data.bookingId)).data.status == 'cancelled'
+              && getAfter(/databases/$(database)/documents/groups/$(g)).data.activeTripId != t)
+            || (resource.data.status == 'deleted' && request.resource.data.status == resource.data.deletedFrom
+              && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['startAt','endAt','startKm','endKm'])
+              && ((request.resource.data.status == 'completed' && validTrip(request.resource.data))
+                || (request.resource.data.status == 'active' && group(g).activeTripId == null
+                  && getAfter(/databases/$(database)/documents/groups/$(g)).data.activeTripId == t))
+              && getAfter(/databases/$(database)/documents/groups/$(g)/bookings/$(resource.data.bookingId)).data.status == request.resource.data.status)
+          );
+        allow update: if resource.data.get('ledgerAction','') in ['update','delete','restore'] && owner(g)
+          && changedOnly(['ledgerState','ledgerClaimedAt','ledgerCreateStarted','sync','expenseId'])
+          && request.resource.data.ledgerState in ['sending','pending','uncertain','done']
+          && request.resource.data.get('ledgerCreateStarted',false) is bool
+          && short(request.resource.data.expenseId,64)
+          && request.resource.data.sync in ['local','pending','sending','uncertain','sent'];
+        match /changes/{change} {
+          allow read: if member(g);
+          allow create: if owner(g) && request.resource.data.keys().hasOnly(['actorId','actorName','action','at','reason','before'])
+            && request.resource.data.actorId == uid() && request.resource.data.at == request.time
+            && request.resource.data.action in ['editTrip','deleteTrip','restoreTrip']
+            && short(request.resource.data.actorName,80) && short(request.resource.data.reason,500)
+            && request.resource.data.before == get(/databases/$(database)/documents/groups/$(g)/trips/$(t)).data
+            && getAfter(/databases/$(database)/documents/groups/$(g)/trips/$(t)).data.changeId == change;
+        }
+
         allow read: if member(g);
         allow create: if member(g) && request.resource.data.keys().hasOnly([
-          'userId','driver','bookingId','startAt','startKm','endAt','endKm','status','sync','expenseId','remoteGroupId','payerId','borrowerId'])
+          'userId','driver','bookingId','startAt','startKm','endAt','endKm','status','sync','expenseId','remoteGroupId','payerId','borrowerId','riderIds','borrowerIds'])
           && request.resource.data.userId == uid() && short(request.resource.data.driver, 80)
           && request.resource.data.startAt == request.time && request.resource.data.startKm is int
           && request.resource.data.startKm >= 0 && request.resource.data.startKm < 10000000
@@ -123,13 +201,15 @@ service cloud.firestore {
           && request.resource.data.endAt == null && request.resource.data.endKm == null
           && request.resource.data.status == 'active' && request.resource.data.sync == 'local' && request.resource.data.expenseId == ''
           && request.resource.data.remoteGroupId == '' && request.resource.data.payerId == '' && request.resource.data.borrowerId == ''
+          && request.resource.data.get('borrowerIds',[]) == []
+          && riders(request.resource.data) == riders(get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data)
           && get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data.userId == uid()
           && get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data.status == 'approved'
           && get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data.startAt <= request.time
           && get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data.endAt > request.time
           && group(g).activeTripId == null && getAfter(/databases/$(database)/documents/groups/$(g)).data.activeTripId == t;
-        allow update: if member(g) && resource.data.userId == uid() && (
-          (resource.data.status == 'active' && changedOnly(['status','endAt','endKm'])
+        allow update: if member(g) && (resource.data.userId == uid() || owner(g)) && ledgerIdle(resource.data) && (
+          (resource.data.userId == uid() && resource.data.status == 'active' && changedOnly(['status','endAt','endKm'])
             && request.resource.data.status == 'completed' && request.resource.data.endAt is timestamp
             && request.resource.data.endAt >= resource.data.startAt
             && request.resource.data.endAt <= request.time + duration.value(5, 'm')
@@ -143,10 +223,10 @@ service cloud.firestore {
             && short(request.resource.data.expenseId, 64))
           || (resource.data.status == 'completed' && resource.data.remoteGroupId == ''
             && resource.data.sync in ['local','pending'] && request.resource.data.sync == 'sending'
-            && changedOnly(['sync','remoteGroupId','payerId','borrowerId'])
+            && changedOnly(['sync','remoteGroupId','payerId','borrowerId','borrowerIds'])
             && request.resource.data.remoteGroupId == group(g).spliitGroupId
             && request.resource.data.payerId == group(g).ownerMemberId
-            && request.resource.data.borrowerId == get(/databases/$(database)/documents/groups/$(g)/members/$(uid())).data.spliitMemberId
+            && validMappedRiders(g,request.resource.data)
             && request.resource.data.borrowerId != request.resource.data.payerId
             && request.resource.data.remoteGroupId != '' && request.resource.data.borrowerId != '')
         );

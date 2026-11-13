@@ -86,47 +86,58 @@ class HousePage extends StatelessWidget {
                 'A helpful tap on the shoulder.',
                 style: TextStyle(fontSize: 19, fontWeight: FontWeight.w600),
               ),
-              const SizedBox(height: 8),
-              small(
-                'Set home while you’re there. During a trip, the phone watches for leaving and returning to a 200 m area. It reminds you to finish; it never stops billing without your confirmation.',
-              ),
-              const SizedBox(height: 12),
-              Text(
-                'Home: ${status['homeSet'] == true ? 'set on this phone' : 'not set'}',
-              ),
-              Text(
-                'Notifications: ${status['notifications'] == true ? 'on' : 'not enabled'}',
-              ),
-              Text(
-                'Arrival access: ${status['background'] == true && status['precise'] == true ? 'enabled' : 'needs precise location, all the time'}',
-              ),
               const SizedBox(height: 12),
               Wrap(
                 spacing: 8,
-                runSpacing: 8,
+                runSpacing: 10,
                 children: [
-                  OutlinedButton(
-                    onPressed: model.busy
-                        ? null
-                        : () => model.run(() async {
-                            await model.phone.setHome();
-                            await model.refreshPhone();
-                          }),
-                    child: const Text('Set current location as home'),
-                  ),
-                  OutlinedButton(
-                    onPressed: () => model.run(() async {
-                      await model.phone.notifications();
-                      await model.refreshPhone();
-                    }),
-                    child: const Text('Enable notifications'),
-                  ),
-                  TextButton(
-                    onPressed: () =>
-                        model.run(() => model.phone.backgroundSettings()),
-                    child: const Text('Open location settings'),
-                  ),
+                  if (status['homeSet'] == true)
+                    FilledButton.icon(
+                      key: const Key('home-ready'),
+                      onPressed: () => showHome(context),
+                      icon: const Icon(Icons.check_circle_outline),
+                      label: const Text('Home location set'),
+                    )
+                  else
+                    OutlinedButton.icon(
+                      onPressed: model.busy ? null : () => setHome(context),
+                      icon: const Icon(Icons.home_outlined),
+                      label: const Text('Set home location'),
+                    ),
+                  if (status['notifications'] == true)
+                    FilledButton.icon(
+                      key: const Key('notifications-ready'),
+                      onPressed: () =>
+                          model.run(model.phone.notificationSettings),
+                      icon: const Icon(Icons.check_circle_outline),
+                      label: const Text('Notifications enabled'),
+                    )
+                  else
+                    OutlinedButton.icon(
+                      onPressed: model.busy
+                          ? null
+                          : () => model.run(() async {
+                              await model.phone.notifications(
+                                openSettingsIfNeeded: true,
+                              );
+                              await model.refreshPhone();
+                            }),
+                      icon: const Icon(Icons.notifications_outlined),
+                      label: const Text('Enable notifications'),
+                    ),
                 ],
+              ),
+              if (status['homeSet'] == true) ...[
+                const SizedBox(height: 14),
+                HomeLocationDetails(model: model),
+              ],
+              const SizedBox(height: 12),
+              Text(
+                'Arrival access: ${status['background'] == true && status['precise'] == true ? 'enabled' : 'needs precise location, all the time'}',
+              ),
+              TextButton(
+                onPressed: () => model.run(model.phone.backgroundSettings),
+                child: const Text('Open location settings'),
               ),
               small(
                 'In Android settings choose Permissions → Location → Allow all the time, with precise location. Arrival alerts can be delayed by Android; check the return time when finishing. No route history is collected.',
@@ -202,7 +213,7 @@ class HousePage extends StatelessWidget {
                   ),
                   const SizedBox(height: 12),
                   small(
-                    'Charging is included. Pay on the 1st of the following month. Parking, ferries, tickets and damage are separate. A late return may incur a discretionary \$20 fee. Lost keys cost \$20 plus replacement and reprogramming; these fees are not applied automatically. Regular daily trips with the owners are free; longer shared trips are agreed separately. This app records solo borrowed trips.',
+                    'Charging is included. Pay on the 1st of the following month. Parking, ferries, tickets and damage are separate. A late return may incur a discretionary \$20 fee. Lost keys cost \$20 plus replacement and reprogramming; these fees are not applied automatically. Regular daily trips with the owners are free; longer shared trips are agreed separately. Shared borrowed rides split one trip total equally.',
                   ),
                 ],
               ),
@@ -215,6 +226,64 @@ class HousePage extends StatelessWidget {
             child: const Text('Sign out'),
           ),
       ],
+    );
+  }
+
+  Future<void> setHome(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Use your current location as home?'),
+        content: const Text(
+          'Do this while you’re at home. Arrival reminders use a 200 m area around the saved point.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Back'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Set home here'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await model.run(() async {
+        await model.phone.setHome();
+        await model.refreshPhone();
+      });
+    }
+  }
+
+  Future<void> showHome(BuildContext context) async {
+    await showDialog(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Your home reminder area'),
+        content: SizedBox(
+          width: 420,
+          child: ListenableBuilder(
+            listenable: model,
+            builder: (context, _) =>
+                HomeLocationDetails(model: model, showMap: true),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(dialogContext);
+              setHome(context);
+            },
+            child: const Text('Change home location'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Done'),
+          ),
+        ],
+      ),
     );
   }
 
@@ -375,9 +444,54 @@ class _SpliitSetupState extends State<SpliitSetup> {
           ),
         ],
         small(
-          'Each borrower chooses their own Spliit participant in House settings. Final expenses are created when they finish a trip and their phone is online.',
+          'Each borrower chooses their own Spliit participant in House settings. The requester records the trip once. All borrowers on a shared ride must be linked before its expense is sent.',
         ),
       ],
     ),
   );
+}
+
+class HomeLocationDetails extends StatelessWidget {
+  const HomeLocationDetails({
+    super.key,
+    required this.model,
+    this.showMap = false,
+  });
+  final AppModel model;
+  final bool showMap;
+  @override
+  Widget build(BuildContext context) {
+    final status = model.phoneStatus;
+    final lat = status['homeLat'] as num?, lng = status['homeLng'] as num?;
+    final address = status['homeAddress'] as String?;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Icon(Icons.location_on_outlined),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                address?.isNotEmpty == true
+                    ? address!
+                    : model.homeAddressLoading
+                    ? 'Looking up the address…'
+                    : 'Saved home point',
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+            ),
+          ],
+        ),
+        if (showMap && lat != null && lng != null)
+          TextButton.icon(
+            onPressed: () => model.run(model.phone.viewHome),
+            icon: const Icon(Icons.map_outlined),
+            label: const Text('View in Maps'),
+          ),
+      ],
+    );
+  }
 }

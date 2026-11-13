@@ -9,15 +9,20 @@ import '../data/phone_service.dart';
 class AppModel extends ChangeNotifier {
   AppModel(this.repository, this.phone) {
     repository.addListener(_changed);
+    phone.onNotificationOpened(refreshPhone);
   }
   final Repository repository;
   final PhoneService phone;
   bool busy = false;
   String? message;
   Map<String, dynamic> phoneStatus = {};
+  bool homeAddressLoading = false;
+  String? _addressRequest;
+  bool openTripRequested = false;
   Json? pendingFinish;
   final Set<String> _attempted = {};
   bool _autoWorking = false;
+  String _syncConfiguration = '';
   String? _restoredGroup;
   String _phoneTrip = 'loading';
   bool _disposed = false;
@@ -28,6 +33,19 @@ class AppModel extends ChangeNotifier {
   List<Json> get completed =>
       repository.trips.where((t) => t['status'] == 'completed').toList();
   void _changed() {
+    final config =
+        '${repository.group?['spliitGroupId']}/${repository.group?['ownerMemberId']}/${repository.members.map((m) => '${m['id']}:${m['spliitMemberId']}').join(',')}';
+    if (config != _syncConfiguration) {
+      _syncConfiguration = config;
+      _attempted.clear();
+    }
+    if (pendingFinish?.isNotEmpty == true &&
+        repository.tripsReady &&
+        repository.trips.any(
+          (t) => t['id'] == pendingFinish!['id'] && t['status'] != 'active',
+        )) {
+      pendingFinish = null;
+    }
     if (repository.tripsReady && repository.group != null) {
       final tripId = active?['id'] as String? ?? '';
       if (_phoneTrip != tripId) {
@@ -60,15 +78,33 @@ class AppModel extends ChangeNotifier {
         repository.demo ||
         repository.group == null ||
         (repository.group!['spliitGroupId'] as String? ?? '').isEmpty ||
-        (repository.me?['spliitMemberId'] as String? ?? '').isEmpty) {
+        (!owner &&
+            (repository.me?['spliitMemberId'] as String? ?? '').isEmpty)) {
       return;
     }
     _autoWorking = true;
     try {
+      if (owner) {
+        for (final trip in repository.trips.where(
+          (t) => t['ledgerState'] == 'pending',
+        )) {
+          final key = 'correction:${trip['id']}:${trip['changeId']}';
+          if (_attempted.add(key)) {
+            try {
+              await repository.command('syncCorrection', {'id': trip['id']});
+            } catch (_) {}
+          }
+        }
+      }
       final pending = completed
           .where(
             (t) =>
-                t['userId'] == repository.uid &&
+                (owner || t['userId'] == repository.uid) &&
+                ![
+                  'pending',
+                  'sending',
+                  'uncertain',
+                ].contains(t['ledgerState']) &&
                 ['local', 'pending'].contains(t['sync']) &&
                 !_attempted.contains(t['id']),
           )
@@ -88,6 +124,15 @@ class AppModel extends ChangeNotifier {
     _attempted.clear();
     try {
       phoneStatus = await phone.status();
+      if (await phone.consumeTripOpen()) openTripRequested = true;
+      final homeKey = '${phoneStatus['homeLat']}/${phoneStatus['homeLng']}';
+      if (phoneStatus['homeSet'] == true &&
+          (phoneStatus['homeAddress'] as String? ?? '').isEmpty &&
+          _addressRequest != homeKey) {
+        _addressRequest = homeKey;
+        homeAddressLoading = true;
+        unawaited(_loadHomeAddress(homeKey));
+      }
     } catch (_) {
       phoneStatus = {};
     }
@@ -103,6 +148,24 @@ class AppModel extends ChangeNotifier {
       notifyListeners();
       unawaited(_automaticSync());
     }
+  }
+
+  Future<void> _loadHomeAddress(String homeKey) async {
+    String? address;
+    try {
+      address = await phone.homeAddress();
+    } catch (_) {}
+    if (_disposed ||
+        '${phoneStatus['homeLat']}/${phoneStatus['homeLng']}' != homeKey) {
+      return;
+    }
+    homeAddressLoading = false;
+    if (address != null) phoneStatus = {...phoneStatus, 'homeAddress': address};
+    notifyListeners();
+  }
+
+  void consumeTripScreenRequest() {
+    openTripRequested = false;
   }
 
   String friendly(Object e) {
@@ -146,7 +209,14 @@ class AppModel extends ChangeNotifier {
   }
 
   Future<bool> action(String action, [Json data = const {}]) => run(() async {
-    await repository.command(action, data);
+    final result = await repository.command(action, data);
+    if (result['needsLedger'] == true) {
+      try {
+        await repository.command('syncCorrection', {'id': data['id']});
+      } catch (_) {
+        message = 'Trip saved. Its Spliit correction still needs a check in Activity.';
+      }
+    }
     if (action == 'start') {
       try {
         await phone.notifications();
@@ -178,6 +248,7 @@ class AppModel extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    phone.onNotificationOpened(null);
     repository.removeListener(_changed);
     super.dispose();
   }
