@@ -302,9 +302,6 @@ class _OdometerFormState extends State<OdometerForm> {
   @override
   void initState() {
     super.initState();
-    if (!finishing) {
-      km.text = '${widget.model.repository.group?['lastOdometer'] ?? ''}';
-    }
     final arrival = widget.model.phoneStatus['arrival'];
     if (finishing && arrival is int) {
       final at = DateTime.fromMillisecondsSinceEpoch(arrival);
@@ -384,9 +381,7 @@ class _OdometerFormState extends State<OdometerForm> {
   @override
   Widget build(BuildContext context) {
     final value = int.tryParse(km.text);
-    final startKm = finishing
-        ? widget.trip!['startKm'] as int
-        : widget.model.repository.group?['lastOdometer'] as int? ?? 0;
+    final startKm = finishing ? widget.trip!['startKm'] as int : 0;
     final valid =
         value != null &&
         value >= startKm &&
@@ -436,7 +431,7 @@ class _OdometerFormState extends State<OdometerForm> {
               suffixText: 'km',
               helperText: finishing
                   ? 'Started at $startKm km'
-                  : 'Last recorded: ${startKm == 0 ? 'no reading yet' : '$startKm km'}. Check against the car.',
+                  : 'Use the car’s current reading.',
             ),
           ),
           OutlinedButton.icon(
@@ -489,9 +484,9 @@ class _OdometerFormState extends State<OdometerForm> {
                 ],
               ),
             ),
-          if (value != null && value < startKm)
+          if (finishing && value != null && value < startKm)
             const Text(
-              'The odometer cannot be lower than the previous reading.',
+              'The ending odometer cannot be lower than this trip’s starting reading.',
               style: TextStyle(color: Colors.red),
             ),
           FilledButton(

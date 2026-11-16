@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'spliit_service.dart';
 import '../domain/pricing.dart';
 import '../domain/shared_ride.dart';
+import '../domain/trip_start.dart';
 
 typedef Json = Map<String, dynamic>;
 String randomCode([int length = 32]) {
@@ -444,10 +445,13 @@ class FirebaseRepository extends Repository {
             throw StateError('An approved request is needed first.');
           }
           final now = DateTime.now();
-          if (now.isBefore((b['startAt'] as Timestamp).toDate()) ||
-              !now.isBefore((b['endAt'] as Timestamp).toDate())) {
+          if (!canStartTrip(
+            bookedStart: (b['startAt'] as Timestamp).toDate(),
+            bookedEnd: (b['endAt'] as Timestamp).toDate(),
+            now: now,
+          )) {
             throw StateError(
-              'Start the trip within its approved booking time. Ask an owner if your plans have changed.',
+              'You can start up to 1 hour before the booked start, and before the booked return time.',
             );
           }
           tx.set(groupRef.collection('trips').doc(id), {

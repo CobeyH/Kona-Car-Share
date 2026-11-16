@@ -1,7 +1,7 @@
 name: kona_share
 description: Roommate car sharing with bookings, odometer readings and Spliit expenses.
 publish_to: none
-version: 0.2.0+2
+version: 0.2.1+3
 environment:
   sdk: ^3.13.0
 dependencies:

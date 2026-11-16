@@ -12,7 +12,7 @@ An Android app for a household sharing a Hyundai Kona. Borrowers request a time,
 - **Approve** reserves the car immediately. **Fine by me** records only that owner’s response and leaves the request pending until every current owner agrees, or any one owner approves directly. Cards show who has responded and who is still waiting. Approval still checks for overlapping reservations; simultaneous responses are merged in a transaction. Declines, optional decline notes, cancellations, and shared booking history remain available.
 - Transactional approval checks to prevent simultaneous owners approving overlapping reservations.
 - Add any approved booking to an Android calendar through its normal event editor. This exports a copy; later booking changes do not automatically update an exported event.
-- Start an approved trip with a typed or photo-assisted odometer reading. The start time is recorded automatically. One active trip is allowed per vehicle group, and it must start within its approved time window.
+- Start an approved trip with a typed or photo-assisted odometer reading. The start time is recorded automatically. One active trip is allowed per vehicle group, and it can start up to one hour before the booked start and before the booked return. Pricing uses the actual start time, including any early time. Starting odometer readings are independent of previous trips; only an ending reading below that same trip’s start is rejected.
 - Finish with the ending odometer and a confirmed return time, with an itemized fare.
 - Android arrival-home reminders using a 200 m geofence, an active-trip notification, and an approximate four-hour fallback reminder. Location is optional for trip logging.
 - On-device odometer photo recognition, with explicit selection/confirmation of a candidate number. Dashboard photos are not uploaded.
@@ -54,7 +54,7 @@ The agreement also lists a discretionary $20 late fee; lost keys at $20 plus rep
 
 ## Android testing release
 
-Download [Kona Share 0.2.0](https://github.com/CobeyH/Kona-Car-Share/releases/tag/v0.2.0) and open the ARM64 APK on an Android 8+ phone. When prompted, allow **Install unknown apps → Allow from this source** for the browser or file app opening it, then return to install. Root and USB debugging are not required. You can disable that source permission after installation. See [Android’s installation guidance](https://developer.android.com/distribute/marketing-tools/alternative-distribution?hl=en).
+Download [Kona Share 0.2.1](https://github.com/CobeyH/Kona-Car-Share/releases/tag/v0.2.1) and open the ARM64 APK on an Android 8+ phone. When prompted, allow **Install unknown apps → Allow from this source** for the browser or file app opening it, then return to install. Root and USB debugging are not required. You can disable that source permission after installation. See [Android’s installation guidance](https://developer.android.com/distribute/marketing-tools/alternative-distribution?hl=en).
 
 Updates use the same signing certificate and a higher version code. Install over the existing app to keep its account and phone settings; do not uninstall first. Each borrower on a shared ride must have linked their own Spliit participant. This is a household testing build distributed through GitHub, not Google Play.
 

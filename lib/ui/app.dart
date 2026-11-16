@@ -9,6 +9,7 @@ import 'package:timezone/timezone.dart' as tz;
 import '../data/repository.dart';
 import '../domain/pricing.dart';
 import '../domain/shared_ride.dart';
+import '../domain/trip_start.dart';
 import 'app_model.dart';
 
 part 'trip_forms.dart';
@@ -591,9 +592,12 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
         .where((v) => !clearances.containsKey(v['id']))
         .map((v) => v['name'])
         .join(', ');
-    final inWindow =
-        !DateTime.now().isBefore(DateTime.parse(b['startAt'])) &&
-        DateTime.now().isBefore(DateTime.parse(b['endAt']));
+    final now = DateTime.now();
+    final inWindow = canStartTrip(
+      bookedStart: DateTime.parse(b['startAt']),
+      bookedEnd: DateTime.parse(b['endAt']),
+      now: now,
+    );
     return Panel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -698,7 +702,11 @@ class _MainShellState extends State<MainShell> with WidgetsBindingObserver {
                           ),
                         ),
                   child: Text(
-                    inWindow ? 'Start trip' : 'Start during booked time',
+                    inWindow
+                        ? 'Start trip'
+                        : now.isBefore(DateTime.parse(b['endAt']))
+                        ? 'Start up to 1 hour early'
+                        : 'Booking has ended',
                   ),
                 ),
               if (['requested', 'approved'].contains(status) &&

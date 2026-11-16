@@ -101,8 +101,8 @@ test('concurrent owner approvals cannot book the same time twice',async () => {
   assert.equal(results.filter(r => r.status==='fulfilled').length,1);
   assert.equal(results.filter(r => r.status==='rejected').length,1);
 });
-test('approved borrower can start and finish; odometer cannot go backwards',async () => {
-  await env.withSecurityRulesDisabled(async c => { await updateDoc(doc(c.firestore(),'groups/g/bookings/a'), {status:'approved',startAt:Timestamp.fromMillis(Date.now()-60000)}); });
+test('new trip ignores the previous odometer but ending readings cannot go below its own start',async () => {
+  await env.withSecurityRulesDisabled(async c => { await updateDoc(doc(c.firestore(),'groups/g/bookings/a'), {status:'approved',startAt:Timestamp.fromMillis(Date.now()-60000)}); await updateDoc(doc(c.firestore(),'groups/g'),{lastOdometer:900000}); });
   const db = dbFor('borrower');
   const batch = writeBatch(db);
   batch.set(doc(db,'groups/g/trips/t'),{userId:'borrower',driver:'borrower',bookingId:'a',
@@ -141,13 +141,34 @@ test('Spliit participants cannot be stolen or set to the owner payer', async () 
 });
 
 
-test('a borrower cannot start a future booking early', async () => {
-  await updateDoc(doc(dbFor('owner'),'groups/g/bookings/a'),{status:'approved'});
+async function beginEarlyTrip(startsInMs, {expired=false, suppliedStart=null}={}) {
+  const start=Timestamp.fromMillis(Date.now()+startsInMs);
+  await env.withSecurityRulesDisabled(async c=>{
+    await updateDoc(doc(c.firestore(),'groups/g/bookings/a'),{status:'approved',startAt:start,endAt:Timestamp.fromMillis(expired ? Date.now()-60000 : start.toMillis()+7200000)});
+  });
   const db=dbFor('borrower'),b=writeBatch(db);
-  b.set(doc(db,'groups/g/trips/early'),{userId:'borrower',driver:'borrower',bookingId:'a',startAt:serverTimestamp(),startKm:42000,endAt:null,endKm:null,status:'active',sync:'local',expenseId:'',remoteGroupId:'',payerId:'',borrowerId:''});
+  b.set(doc(db,'groups/g/trips/early'),{userId:'borrower',driver:'borrower',bookingId:'a',startAt:suppliedStart??serverTimestamp(),startKm:42000,endAt:null,endKm:null,status:'active',sync:'local',expenseId:'',remoteGroupId:'',payerId:'',borrowerId:''});
   b.update(doc(db,'groups/g/bookings/a'),{status:'active'});
   b.update(doc(db,'groups/g'),{activeTripId:'early'});
-  await assertFails(b.commit());
+  return b.commit();
+}
+test('a borrower can start 30 minutes early with the actual server time',async()=>{
+  const before=Date.now();await assertSucceeds(beginEarlyTrip(1800000));
+  const db=dbFor('borrower'),trip=(await getDoc(doc(db,'groups/g/trips/early'))).data();
+  const booking=(await getDoc(doc(db,'groups/g/bookings/a'))).data();
+  assert.ok(trip.startAt.toMillis()>=before);assert.ok(trip.startAt.toMillis()<=Date.now());
+  assert.ok(trip.startAt.toMillis()<booking.startAt.toMillis());
+});
+test('a borrower can start exactly one hour early',async()=>{
+  await assertSucceeds(beginEarlyTrip(3600000));
+});
+test('starting more than one hour early or after the booked return is refused',async()=>{
+  await assertFails(beginEarlyTrip(3660000));
+  await assertFails(beginEarlyTrip(-7200000,{expired:true}));
+});
+test('an early start cannot substitute a planned or backdated start time',async()=>{
+  await assertFails(beginEarlyTrip(1800000,{suppliedStart:Timestamp.fromMillis(Date.now()+1800000)}));
+  await assertFails(beginEarlyTrip(1800000,{suppliedStart:Timestamp.fromMillis(Date.now()-60000)}));
 });
 
 async function seedRecordedTrip(active=false) {

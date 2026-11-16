@@ -1,6 +1,7 @@
 import 'repository.dart';
 import '../domain/pricing.dart';
 import '../domain/shared_ride.dart';
+import '../domain/trip_start.dart';
 
 class DemoRepository extends Repository {
   DemoRepository() {
@@ -131,6 +132,19 @@ class DemoRepository extends Repository {
           throw StateError('There is already an active trip.');
         }
         final b = bookings.firstWhere((b) => b['id'] == data['id']);
+        if (b['userId'] != uid || b['status'] != 'approved') {
+          throw StateError('An approved request is needed first.');
+        }
+        final now = DateTime.now();
+        if (!canStartTrip(
+          bookedStart: DateTime.parse(b['startAt']),
+          bookedEnd: DateTime.parse(b['endAt']),
+          now: now,
+        )) {
+          throw StateError(
+            'You can start up to 1 hour before the booked start, and before the booked return time.',
+          );
+        }
         final id = randomCode(21);
         trips = [
           {
@@ -139,7 +153,7 @@ class DemoRepository extends Repository {
             'riderIds': rideUserIds(b),
             'userId': uid,
             'driver': user!['name'],
-            'startAt': DateTime.now().toIso8601String(),
+            'startAt': now.toIso8601String(),
             'startKm': data['km'],
             'status': 'active',
             'sync': 'local',

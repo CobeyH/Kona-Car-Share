@@ -197,7 +197,6 @@ service cloud.firestore {
           && request.resource.data.userId == uid() && short(request.resource.data.driver, 80)
           && request.resource.data.startAt == request.time && request.resource.data.startKm is int
           && request.resource.data.startKm >= 0 && request.resource.data.startKm < 10000000
-          && (group(g).lastOdometer == null || request.resource.data.startKm >= group(g).lastOdometer)
           && request.resource.data.endAt == null && request.resource.data.endKm == null
           && request.resource.data.status == 'active' && request.resource.data.sync == 'local' && request.resource.data.expenseId == ''
           && request.resource.data.remoteGroupId == '' && request.resource.data.payerId == '' && request.resource.data.borrowerId == ''
@@ -205,7 +204,7 @@ service cloud.firestore {
           && riders(request.resource.data) == riders(get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data)
           && get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data.userId == uid()
           && get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data.status == 'approved'
-          && get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data.startAt <= request.time
+          && get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data.startAt <= request.time + duration.value(1, 'h')
           && get(/databases/$(database)/documents/groups/$(g)/bookings/$(request.resource.data.bookingId)).data.endAt > request.time
           && group(g).activeTripId == null && getAfter(/databases/$(database)/documents/groups/$(g)).data.activeTripId == t;
         allow update: if member(g) && (resource.data.userId == uid() || owner(g)) && ledgerIdle(resource.data) && (
